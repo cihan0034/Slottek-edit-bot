@@ -3,160 +3,227 @@ from io import BytesIO
 
 import requests
 from flask import Flask, request
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageFile
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 app = Flask(__name__)
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 TELEGRAM_FILE = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
 
 LOGO_PATH = "logo.png"
 
+# Ayarlar
+TARGET_LONG_EDGE = 7680          # 8K uzun kenar
+LOGO_WIDTH_RATIO = 0.43          # logo genişliği = görselin %43'ü
+BOTTOM_MARGIN_RATIO = 0.045      # alttan boşluk
+JPEG_QUALITY = 96                # çıktı kalitesi
 
-def send_message(chat_id, text):
+
+def send_message(chat_id, text, reply_to_message_id=None):
+    data = {
+        "chat_id": chat_id,
+        "text": text,
+    }
+    if reply_to_message_id:
+        data["reply_to_message_id"] = reply_to_message_id
+
     requests.post(
         f"{TELEGRAM_API}/sendMessage",
-        data={
-            "chat_id": chat_id,
-            "text": text
-        },
-        timeout=30
+        data=data,
+        timeout=60
     )
 
 
-def add_logo(photo_bytes):
-    # Gelen fotoğrafı aç
+def send_document(chat_id, file_bytes, filename="slottek_8k.jpg", caption="Hazır ✅", reply_to_message_id=None):
+    data = {
+        "chat_id": chat_id,
+        "caption": caption,
+    }
+    if reply_to_message_id:
+        data["reply_to_message_id"] = reply_to_message_id
+
+    files = {
+        "document": (filename, file_bytes, "image/jpeg")
+    }
+
+    requests.post(
+        f"{TELEGRAM_API}/sendDocument",
+        data=data,
+        files=files,
+        timeout=120
+    )
+
+
+def get_file_path(file_id):
+    r = requests.get(
+        f"{TELEGRAM_API}/getFile",
+        params={"file_id": file_id},
+        timeout=60
+    )
+    result = r.json()
+    if not result.get("ok"):
+        raise Exception(f"getFile hatası: {result}")
+    return result["result"]["file_path"]
+
+
+def download_telegram_file(file_path):
+    r = requests.get(f"{TELEGRAM_FILE}/{file_path}", timeout=120)
+    r.raise_for_status()
+    return r.content
+
+
+def load_logo():
+    logo = Image.open(LOGO_PATH).convert("RGBA")
+
+    # Şeffaf boşlukları kırp
+    alpha = logo.getchannel("A")
+    bbox = alpha.getbbox()
+    if bbox:
+        logo = logo.crop(bbox)
+
+    return logo
+
+
+def upscale_to_8k(img):
+    width, height = img.size
+    long_edge = max(width, height)
+
+    if long_edge >= TARGET_LONG_EDGE:
+        return img
+
+    scale = TARGET_LONG_EDGE / long_edge
+    new_width = int(width * scale)
+    new_height = int(height * scale)
+
+    return img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+
+
+def add_logo_and_make_8k(photo_bytes):
+    # Ana görseli aç
     photo = Image.open(BytesIO(photo_bytes))
     photo = ImageOps.exif_transpose(photo).convert("RGBA")
 
-    # SLOTTEK PNG
-    logo = Image.open(LOGO_PATH).convert("RGBA")
+    # 8K uzun kenara upscale
+    photo = upscale_to_8k(photo)
 
-    # Logo genişliği fotoğrafın yaklaşık %25'i
-    target_width = int(photo.width * 0.25)
+    # Logo yükle
+    logo = load_logo()
 
-    ratio = target_width / logo.width
-    target_height = int(logo.height * ratio)
+    # Fotoğrafa göre logo boyutu
+    target_width = int(photo.width * LOGO_WIDTH_RATIO)
+    scale = target_width / logo.width
+    target_height = int(logo.height * scale)
 
-    logo = logo.resize(
-        (target_width, target_height),
-        Image.Resampling.LANCZOS
-    )
+    logo = logo.resize((target_width, target_height), Image.Resampling.LANCZOS)
 
-    # Kenarlardan boşluk
-    margin = int(photo.width * 0.03)
+    # Tam orta alt
+    x = (photo.width - logo.width) // 2
+    bottom_margin = int(photo.height * BOTTOM_MARGIN_RATIO)
+    y = photo.height - logo.height - bottom_margin
 
-    # Sağ alt köşe
-    x = photo.width - logo.width - margin
-    y = photo.height - logo.height - margin
-
+    # Ekleyelim
     photo.alpha_composite(logo, (x, y))
 
-    # Telegram'a JPG olarak gönder
+    # JPEG olarak çıktı ver
     output = BytesIO()
-
-    photo.convert("RGB").save(
+    rgb_photo = photo.convert("RGB")
+    rgb_photo.save(
         output,
         format="JPEG",
-        quality=95,
-        optimize=True
+        quality=JPEG_QUALITY,
+        optimize=True,
+        subsampling=0
     )
-
     output.seek(0)
-
     return output
 
 
-def process_photo(message):
+def process_photo_message(message):
     chat_id = message["chat"]["id"]
+    message_id = message["message_id"]
 
-    photos = message.get("photo")
+    try:
+        send_message(chat_id, "Görsel hazırlanıyor, lütfen bekleyin... ⏳", reply_to_message_id=message_id)
 
-    if not photos:
-        return
+        # Eğer normal fotoğraf geldiyse
+        if "photo" in message:
+            file_id = message["photo"][-1]["file_id"]
 
-    # Telegram'ın gönderdiği en yüksek kaliteli fotoğraf
-    file_id = photos[-1]["file_id"]
+        # Eğer belge olarak resim geldiyse
+        elif "document" in message and str(message["document"].get("mime_type", "")).startswith("image/"):
+            file_id = message["document"]["file_id"]
 
-    info = requests.get(
-        f"{TELEGRAM_API}/getFile",
-        params={"file_id": file_id},
-        timeout=30
-    ).json()
+        else:
+            send_message(chat_id, "Lütfen bir fotoğraf ya da resim dosyası gönder.", reply_to_message_id=message_id)
+            return
 
-    if not info.get("ok"):
-        send_message(chat_id, "Fotoğraf alınamadı.")
-        return
+        file_path = get_file_path(file_id)
+        photo_bytes = download_telegram_file(file_path)
+        final_file = add_logo_and_make_8k(photo_bytes)
 
-    file_path = info["result"]["file_path"]
+        send_document(
+            chat_id,
+            final_file,
+            filename="slottek_8k.jpg",
+            caption="Hazır ✅",
+            reply_to_message_id=message_id
+        )
 
-    image_response = requests.get(
-        f"{TELEGRAM_FILE}/{file_path}",
-        timeout=60
-    )
-
-    edited = add_logo(image_response.content)
-
-    requests.post(
-        f"{TELEGRAM_API}/sendPhoto",
-        data={
-            "chat_id": chat_id,
-            "caption": "✅ SLOTTEK görseli hazır."
-        },
-        files={
-            "photo": ("slottek.jpg", edited, "image/jpeg")
-        },
-        timeout=60
-    )
+    except Exception as e:
+        send_message(chat_id, f"Hata oluştu: {str(e)}", reply_to_message_id=message_id)
 
 
-@app.route("/", methods=["GET"])
-def home():
-    return "SLOTTEK Edit Bot Aktif ✅", 200
-
-
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    data = request.get_json(silent=True)
-
-    if not data:
-        return "OK", 200
-
-    message = data.get("message")
-
+def handle_update(update):
+    message = update.get("message") or update.get("edited_message")
     if not message:
-        return "OK", 200
+        return
 
     chat_id = message["chat"]["id"]
-
-    text = message.get("text")
+    text = message.get("text", "").strip()
 
     if text == "/start":
         send_message(
             chat_id,
-            "👋 SLOTTEK Edit Bot\n\n"
+            "SLOTTEK edit bot aktif ✅\n\n"
             "Bana bir fotoğraf gönder.\n"
-            "SLOTTEK PNG logosunu otomatik olarak fotoğrafın üzerine ekleyip sana geri göndereceğim."
+            "Logo görselin alt orta kısmına eklenir ve sana yüksek kalite geri gönderilir.\n\n"
+            "En iyi kalite için resmi mümkünse belge olarak da gönderebilirsin."
         )
+        return
 
-    elif message.get("photo"):
-        try:
-            process_photo(message)
-        except Exception as e:
-            print("HATA:", e)
-            send_message(
-                chat_id,
-                "❌ Fotoğraf işlenirken bir hata oluştu."
-            )
+    if "photo" in message:
+        process_photo_message(message)
+        return
 
-    else:
-        send_message(
-            chat_id,
-            "📸 Lütfen bana bir fotoğraf gönder."
-        )
+    if "document" in message and str(message["document"].get("mime_type", "")).startswith("image/"):
+        process_photo_message(message)
+        return
 
-    return "OK", 200
+    if text:
+        send_message(chat_id, "Bana bir fotoğraf gönder, üzerine SLOT TEK ekleyeyim.")
+
+
+@app.route("/", methods=["GET", "POST"])
+def root():
+    if request.method == "GET":
+        return "SLOTTEK Edit Bot Aktif ✅", 200
+
+    update = request.get_json(silent=True) or {}
+    handle_update(update)
+    return {"ok": True}, 200
+
+
+@app.route("/webhook", methods=["POST", "GET"])
+def webhook():
+    if request.method == "GET":
+        return "Webhook aktif ✅", 200
+
+    update = request.get_json(silent=True) or {}
+    handle_update(update)
+    return {"ok": True}, 200
 
 
 if __name__ == "__main__":
